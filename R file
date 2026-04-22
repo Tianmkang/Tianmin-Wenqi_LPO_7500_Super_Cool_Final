@@ -1,0 +1,467 @@
+---
+title: "Tianmin & Wenqi_LPO_7500_Final_Paper_Draft"
+output: html_document
+date: "2026-04-21"
+---
+
+
+```{r}
+rm(list=ls(all=TRUE))
+library(tidyverse)
+library(tidymodels)
+library(janitor)
+library(finetune)
+
+set.seed(2002)
+```
+
+### Data
+### a.Data Source/Data Access and Cleaning
+```{r}
+data <- read_csv("online_course_engagement_data.csv", show_col_types = FALSE) %>%
+  mutate(CourseCompletion = factor(CourseCompletion,
+                                  levels = c(0, 1),
+                                  labels = c("Not Completed", "Completed"))) %>%
+  mutate(CourseCompletion = fct_relevel(CourseCompletion, "Completed"))
+
+```
+
+### b. Train / Calibration / Test Split
+```{r}
+main_split <- initial_split(data, prop = 0.80, strata = CourseCompletion)
+train_cal <- training(main_split)
+cc_test   <- testing(main_split)
+
+cal_split <- initial_split(train_cal, prop = 0.75, strata = CourseCompletion)
+cc_train  <- training(cal_split)
+cc_cal    <- testing(cal_split)
+
+tibble(
+  set = c("train", "calibration", "test"),
+  n = c(nrow(cc_train), nrow(cc_cal), nrow(cc_test))
+)
+```
+
+### Exploratory Analysis
+### a. Outcome Distribution
+
+```{r}
+data %>%
+  count(CourseCompletion) %>%
+  mutate(prop = n / sum(n))
+```
+
+```{r}
+data %>%
+  count(CourseCompletion) %>%
+  ggplot(aes(x = CourseCompletion, y = n, fill = CourseCompletion)) +
+  geom_col(show.legend = FALSE) +
+  labs(title = "Distribution of Course Completion")
+```
+
+### b. Key Feature Relationships
+```{r}
+data %>%
+  ggplot(aes(x = CourseCompletion, y = QuizScores, fill = CourseCompletion)) +
+  geom_boxplot(show.legend = FALSE) +
+  labs(title = "Quiz Scores by Course Completion")
+```
+
+```{r}
+data %>%
+  ggplot(aes(x = CourseCompletion, y = TimeSpentOnCourse, fill = CourseCompletion)) +
+  geom_boxplot(show.legend = FALSE) +
+  labs(title = "Time Spent on Course by Completion")
+```
+
+```{r}
+data %>%
+  ggplot(aes(x = CourseCompletion, y = NumberOfVideosWatched, fill = CourseCompletion)) +
+  geom_boxplot(show.legend = FALSE) +
+  labs(title = "Number Of Videos Watched by Completion")
+```
+```{r}
+data %>%
+  ggplot(aes(x = CourseCompletion, y = NumberOfQuizzesTaken, fill = CourseCompletion)) +
+  geom_boxplot(show.legend = FALSE) +
+  labs(title = "Number Of Quizzes Taken by Completion")
+```
+
+
+```{r}
+data %>%
+  group_by(CourseCompletion) %>%
+  summarise(
+    mean_time = mean(TimeSpentOnCourse, na.rm = TRUE),
+    mean_videos = mean(NumberOfVideosWatched, na.rm = TRUE),
+    mean_quizzes = mean(NumberOfQuizzesTaken, na.rm = TRUE),
+    mean_scores = mean(QuizScores, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+### Model Development
+### a. Preprocessing Pipeline
+
+```{r}
+cc_rec <- recipe(
+  CourseCompletion ~
+    CourseCategory +
+    TimeSpentOnCourse +
+    NumberOfVideosWatched +
+    NumberOfQuizzesTaken +
+    QuizScores,
+  data = cc_train
+) %>%
+  step_unknown(all_nominal_predictors()) %>%
+  step_other(all_nominal_predictors(), threshold = 0.05) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+```
+
+### b. Elastic Net + Bayesian Optimization
+
+```{r}
+enet_mod <- logistic_reg(
+  penalty = tune(),
+  mixture = tune()
+) %>%
+  set_engine("glmnet")
+```
+
+```{r}
+enet_wf <- workflow() %>%
+  add_recipe(cc_rec) %>%
+  add_model(enet_mod)
+```
+
+```{r}
+cc_folds <- vfold_cv(cc_train, v = 10, strata = CourseCompletion)
+```
+
+```{r}
+enet_grid <- grid_space_filling(
+  penalty(),
+  mixture(),
+  size = 10
+)
+```
+
+```{r}
+dir.create("artifacts", showWarnings = FALSE)
+
+fit_model <- TRUE
+
+if (fit_model) {
+
+  enet_tune <- tune_bayes(
+    enet_wf,
+    resamples = cc_folds,
+    initial = 10,
+    iter = 15,
+    metrics = metric_set(roc_auc, accuracy),
+    control = control_bayes(save_pred = TRUE, verbose = TRUE)
+  )
+
+  save(enet_tune, file = "artifacts/enet_tune_bayes.Rdata")
+
+} else {
+  load("artifacts/enet_tune_bayes.Rdata")
+}
+```
+
+```{r}
+show_best(enet_tune, metric = "roc_auc")
+```
+
+```{r}
+best_enet <- select_best(enet_tune, metric = "roc_auc")
+best_enet
+```
+
+```{r}
+final_wf <- finalize_workflow(enet_wf, best_enet)
+final_wf
+```
+
+### Model Performance
+### a. Holdout/Test Performance
+
+```{r}
+final_res <- final_wf %>%
+  last_fit(main_split, metrics = metric_set(roc_auc, accuracy))
+```
+
+```{r}
+collect_metrics(final_res)
+```
+
+```{r}
+test_preds <- collect_predictions(final_res)
+```
+
+### ROC Curve
+
+```{r}
+test_preds %>%
+  roc_curve(truth = CourseCompletion, .pred_Completed) %>%
+  autoplot()
+```
+
+### Calibration Plot
+
+```{r}
+test_preds %>%
+  mutate(pred_bin = ntile(.pred_Completed, 10)) %>%
+  group_by(pred_bin) %>%
+  summarise(
+    mean_pred = mean(.pred_Completed),
+    obs_rate = mean(CourseCompletion == "Completed"),
+    .groups = "drop"
+  ) %>%
+  ggplot(aes(x = mean_pred, y = obs_rate)) +
+  geom_point() +
+  geom_line() +
+  geom_abline(linetype = 2, color = "red") +
+  labs(
+    title = "Calibration Plot",
+    x = "Mean Predicted Probability",
+    y = "Observed Completion Rate"
+  )
+```
+
+### Confusion Matrix
+```{r}
+test_preds %>%
+  conf_mat(truth = CourseCompletion, estimate = .pred_class)
+
+test_preds %>%
+  conf_mat(truth = CourseCompletion, estimate = .pred_class) %>%
+  autoplot(type = "heatmap")
+```
+
+### Final Model Interpretation
+
+```{r}
+final_fit_obj <- extract_workflow(final_res)
+
+tidy(final_fit_obj) %>%
+  arrange(desc(abs(estimate)))
+```
+
+```{r}
+example_preds <- cc_test %>%
+  slice(1:10) %>%
+  bind_cols(
+    predict(final_fit_obj, new_data = slice(cc_test, 1:10), type = "prob"),
+    predict(final_fit_obj, new_data = slice(cc_test, 1:10), type = "class")
+  )
+
+example_preds
+```
+
+### Conformal Prediction Sets
+
+```{r}
+final_fit_train <- fit(final_wf, data = cc_train)
+
+cal_preds <- predict(final_fit_train, new_data = cc_cal, type = "prob") %>%
+  bind_cols(cc_cal %>% select(CourseCompletion))
+
+cal_scores <- cal_preds %>%
+  mutate(
+    score = if_else(
+      CourseCompletion == "Completed",
+      1 - .pred_Completed,
+      1 - `.pred_Not Completed`
+    )
+  )
+```
+
+```{r}
+alpha <- 0.10
+n <- nrow(cal_scores)
+
+q_level <- min(ceiling((n + 1) * (1 - alpha)) / n, 1)
+q_hat <- quantile(cal_scores$score, probs = q_level)
+
+cal_scores %>%
+  ggplot(aes(x = score)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white") +
+  geom_vline(xintercept = q_hat, color = "red", linetype = "dashed") +
+  labs(
+    title = "Calibration Nonconformity Scores",
+    x = "1 - predicted probability of the true class",
+    y = "Count"
+  )
+```
+
+```{r}
+alpha <- 0.10
+n <- nrow(cal_scores)
+
+q_level <- min(ceiling((n + 1) * (1 - alpha)) / n, 1)
+q_hat <- quantile(cal_scores$score, probs = q_level)
+
+q_hat
+```
+
+```{r}
+test_preds <- predict(final_fit_train, new_data = cc_test, type = "prob") %>%
+  bind_cols(cc_test %>% select(CourseCompletion)) %>%
+  mutate(
+    include_completed = (1 - .pred_Completed) <= q_hat,
+    include_not_completed = (1 - `.pred_Not Completed`) <= q_hat,
+    pred_set = case_when(
+      include_completed & include_not_completed ~ "{Completed, Not Completed}",
+      include_completed ~ "{Completed}",
+      include_not_completed ~ "{Not Completed}",
+      TRUE ~ "{}"
+    ),
+    covered = case_when(
+      CourseCompletion == "Completed" ~ include_completed,
+      CourseCompletion == "Not Completed" ~ include_not_completed
+    )
+  )
+```
+
+```{r}
+test_preds %>%
+  summarise(
+    empirical_coverage = mean(covered),
+    avg_set_size = mean(include_completed + include_not_completed)
+  )
+```
+
+```{r}
+test_preds %>%
+  count(pred_set)
+```
+
+### Robustness Checks
+
+```{r}
+test_preds <- collect_predictions(final_res) %>%
+  mutate(
+    .pred_class = if_else(
+      .pred_Completed >= 0.5,
+      "Completed",
+      "Not Completed"
+    ),
+    .pred_class = factor(.pred_class, levels = levels(CourseCompletion))
+  )
+```
+
+```{r}
+test_preds %>%
+  bind_cols(cc_test %>% select(CourseCategory)) %>%
+  group_by(CourseCategory) %>%
+  summarise(
+    n = n(),
+    accuracy = mean(.pred_class == CourseCompletion),
+    auc = roc_auc_vec(
+      truth = CourseCompletion,
+      estimate = .pred_Completed,
+      event_level = "first"
+    ),
+    .groups = "drop"
+  ) %>%
+  arrange(accuracy)
+```
+
+```{r}
+test_preds %>%
+  bind_cols(cc_test %>% select(CourseCategory)) %>%
+  mutate(correct = .pred_class == CourseCompletion) %>%
+  group_by(CourseCategory) %>%
+  summarise(
+    n = n(),
+    error_rate = mean(!correct),
+    false_negative_rate = mean(CourseCompletion == "Completed" & .pred_class == "Not Completed"),
+    false_positive_rate = mean(CourseCompletion == "Not Completed" & .pred_class == "Completed"),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(error_rate))
+```
+
+### Deployment Artifacts
+
+```{r}
+deploy_model <- extract_workflow(final_res)
+
+saveRDS(deploy_model, file = "artifacts/course_completion_model.rds")
+```
+
+```{r}
+input_template <- tibble(
+  CourseCategory = c("Business", "Health"),
+  TimeSpentOnCourse = c(12, 25),
+  NumberOfVideosWatched = c(8, 15),
+  NumberOfQuizzesTaken = c(2, 4),
+  QuizScores = c(78, 92)
+)
+
+input_template
+```
+
+```{r}
+score_course_completion <- function(new_data,
+                                    model_path = "artifacts/course_completion_model.rds") {
+  
+  required_cols <- c(
+    "CourseCategory",
+    "TimeSpentOnCourse",
+    "NumberOfVideosWatched",
+    "NumberOfQuizzesTaken",
+    "QuizScores"
+  )
+  
+  missing_cols <- setdiff(required_cols, names(new_data))
+  
+  if (length(missing_cols) > 0) {
+    stop(paste("Missing required columns:", paste(missing_cols, collapse = ", ")))
+  }
+  
+  model <- readRDS(model_path)
+  
+  prob_preds <- predict(model, new_data = new_data, type = "prob")
+  class_preds <- predict(model, new_data = new_data, type = "class")
+  
+  bind_cols(new_data, prob_preds, class_preds)
+}
+```
+
+```{r}
+new_scores <- score_course_completion(input_template)
+
+new_scores
+```
+
+```{r}
+write_csv(new_scores, "artifacts/example_predictions.csv")
+```
+
+```{r}
+sessionInfo()
+
+list.files("artifacts")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
