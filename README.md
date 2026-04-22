@@ -1,1 +1,1 @@
-# Tianmin-Wenqi_LPO_7500_Super_Cool_Final
+This is the github repository for Tianmin and Wenqi LPO-7500 final project.
